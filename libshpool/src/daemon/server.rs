@@ -346,22 +346,36 @@ impl Server {
             }
             info!("bidi stream loop finished child_done={}", child_done);
 
+            // The session this connection attached to. A kill followed by a
+            // new attach can put a different session under `header.name`
+            // while we were streaming, so table cleanup below only applies
+            // to the entry if it is still this one.
+            let attached_inner = ArcMutexGuard::mutex(&inner);
+
             if child_done {
                 info!("'{}' exited, removing from session table", header.name);
-                if let Err(err) = self.hooks.on_shell_disconnect(&header.name) {
-                    warn!("shell_disconnect hook: {:?}", err);
-                }
-
-                {
+                let replaced = {
                     let _s = span!(Level::INFO, "2_lock(shells)").entered();
                     let mut shells = self.shells.lock();
-                    // The publish below is gated on `is_some()` because a
-                    // concurrent kill or reaper may have already removed the
-                    // entry (and published) while we were waiting for the lock.
-                    if shells.remove(&header.name).is_some() {
-                        self.events_bus.publish(&events::Event::SessionRemoved);
+                    // A concurrent kill or reaper may have already removed the
+                    // entry (and published) while we were waiting for the lock,
+                    // and a new session may since have taken the name.
+                    match shells.get(&header.name) {
+                        Some(session) if Arc::ptr_eq(&session.inner, attached_inner) => {
+                            shells.remove(&header.name);
+                            self.events_bus.publish(&events::Event::SessionRemoved);
+                            false
+                        }
+                        Some(_) => true,
+                        None => false,
                     }
+                };
+                if replaced {
+                    info!("'{}' was replaced by a newer session, leaving it in place", header.name);
+                } else if let Err(err) = self.hooks.on_shell_disconnect(&header.name) {
+                    warn!("shell_disconnect hook: {:?}", err);
                 }
+                test_hooks::emit("daemon-handle-attach-exited-cleanup");
 
                 // The child shell has exited, so the shell->client thread should
                 // attempt to read from its stdout and get an error, causing
@@ -375,15 +389,22 @@ impl Server {
                 }
             } else {
                 // Client disconnected but shell is still running - set last_disconnected_at
-                {
+                let replaced = {
                     let _s = span!(Level::INFO, "disconnect_lock(shells)").entered();
                     let shells = self.shells.lock();
-                    if let Some(session) = shells.get(&header.name) {
-                        session.lifecycle.record_detached();
-                        self.events_bus.publish(&events::Event::SessionDetached);
+                    match shells.get(&header.name) {
+                        Some(session) if Arc::ptr_eq(&session.inner, attached_inner) => {
+                            session.lifecycle.record_detached();
+                            self.events_bus.publish(&events::Event::SessionDetached);
+                            false
+                        }
+                        Some(_) => true,
+                        None => false,
                     }
-                }
-                if let Err(err) = self.hooks.on_client_disconnect(&header.name) {
+                };
+                if replaced {
+                    info!("'{}' was replaced by a newer session, leaving it in place", header.name);
+                } else if let Err(err) = self.hooks.on_client_disconnect(&header.name) {
                     warn!("client_disconnect hook: {:?}", err);
                 }
             }
