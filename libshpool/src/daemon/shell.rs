@@ -40,7 +40,7 @@ use crate::{
     protocol,
     protocol::ChunkExt as _,
     session_restore, test_hooks,
-    tty::TtySizeExt as _,
+    tty::{TtySizeExt as _, DEFAULT_TTY_SIZE},
 };
 
 const SHELL_KILL_TIMEOUT: time::Duration = time::Duration::from_millis(500);
@@ -350,8 +350,22 @@ impl SessionInner {
         let closure = move || {
             let _s = span!(Level::INFO, "shell->client", s = name, cid = args.conn_id).entered();
 
+            // A client whose terminal has no size yet reports 0x0. Such a size never reaches
+            // the spool or the pty: the last usable size (24x80 before any) stays in force.
+            let mut tty_size = if args.tty_size.is_usable() {
+                args.tty_size.clone()
+            } else {
+                warn!(
+                    "new session with unusable tty size (rows={}, cols={}), using {}x{}",
+                    args.tty_size.rows,
+                    args.tty_size.cols,
+                    DEFAULT_TTY_SIZE.rows,
+                    DEFAULT_TTY_SIZE.cols
+                );
+                DEFAULT_TTY_SIZE
+            };
             let mut output_spool =
-                session_restore::new(config, &args.tty_size, args.scrollback_lines);
+                session_restore::Guarded::new(config, &tty_size, args.scrollback_lines);
             let mut buf: Vec<u8> = vec![0; consts::BUF_SIZE];
             let mut poll_fds = [poll::PollFd::new(
                 watchable_master.borrow_fd(),
@@ -369,7 +383,10 @@ impl SessionInner {
             info!("got initial client connection");
 
             let mut resize_cmd = if let ClientConnectionMsg::New(conn) = &client_conn {
-                Some(ResizeCmd { size: conn.size.clone(), when: time::Instant::now() })
+                if conn.size.is_usable() {
+                    tty_size = conn.size.clone();
+                }
+                Some(ResizeCmd { size: tty_size.clone(), when: time::Instant::now() })
             } else {
                 None
             };
@@ -381,6 +398,15 @@ impl SessionInner {
                         match new_connection {
                             Ok(ClientConnectionMsg::New(conn)) => {
                                 info!("got new connection (rows={}, cols={})", conn.size.rows, conn.size.cols);
+                                if conn.size.is_usable() {
+                                    tty_size = conn.size.clone();
+                                } else {
+                                    warn!(
+                                        "client reported an unusable tty size, keeping (rows={}, cols={})",
+                                        tty_size.rows, tty_size.cols
+                                    );
+                                }
+                                let size = tty_size.clone();
                                 do_reattach = true;
                                 let ack = if let ClientConnectionMsg::New(mut old_conn) = client_conn {
                                     Self::write_exit_chunk(&mut old_conn.sink, 0);
@@ -392,23 +418,23 @@ impl SessionInner {
 
                                 // Always instantly resize the spool, since we don't
                                 // need to inject a delay into that.
-                                output_spool.resize(conn.size.clone());
+                                output_spool.resize(size.clone());
 
                                 // First resize the pty to be bigger than it needs to be,
                                 // we do this immediately so that the extra size
                                 // can "bake" for a little bit, which emacs seems
                                 // to require in order to pick up the jiggle.
                                 let oversize = TtySize {
-                                    rows: conn.size.rows + 1,
-                                    cols: conn.size.cols + 1,
-                                    xpixel: conn.size.xpixel,
-                                    ypixel: conn.size.ypixel,
+                                    rows: size.rows.saturating_add(1),
+                                    cols: size.cols.saturating_add(1),
+                                    xpixel: size.xpixel,
+                                    ypixel: size.ypixel,
                                 };
                                 oversize.set_fd(pty_master.raw_fd())?;
 
                                 // Prepare a resize command for pty to execute later.
                                 resize_cmd = Some(ResizeCmd {
-                                    size: conn.size.clone(),
+                                    size,
                                     when: time::Instant::now().add(REATTACH_RESIZE_DELAY),
                                 });
                                 client_conn = ClientConnectionMsg::New(conn);
@@ -463,8 +489,14 @@ impl SessionInner {
                     }
                     recv(args.tty_size_change) -> new_size => {
                         match new_size {
+                            Ok(size) if !size.is_usable() => {
+                                warn!("ignoring unusable tty size change {:?}", size);
+                                args.tty_size_change_ack.send(())
+                                    .context("sending size change ack")?;
+                            }
                             Ok(size) => {
                                 info!("resize size={:?}", size);
+                                tty_size = size.clone();
                                 output_spool.resize(size.clone());
                                 resize_cmd = Some(ResizeCmd {
                                     size,

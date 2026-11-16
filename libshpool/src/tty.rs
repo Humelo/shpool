@@ -39,7 +39,16 @@ nix::ioctl_write_ptr_bad!(tiocswinsz, libc::TIOCSWINSZ, libc::winsize);
 pub trait TtySizeExt {
     fn from_fd(fd: RawFd) -> anyhow::Result<TtySize>;
     fn set_fd(&self, fd: RawFd) -> anyhow::Result<()>;
+    /// Whether both dimensions are non-zero. A terminal that has not been laid
+    /// out yet (or a pty nobody sized) reports 0x0; such a size must never
+    /// reach the pty or the restore spool, whose vt100 grid panics with zero
+    /// rows.
+    fn is_usable(&self) -> bool;
 }
+
+/// The size used when a client reports an unusable size and no earlier size
+/// is known. Matches what `shpool attach` uses when stdin is not a tty.
+pub const DEFAULT_TTY_SIZE: TtySize = TtySize { rows: 24, cols: 80, xpixel: 0, ypixel: 0 };
 
 impl TtySizeExt for TtySize {
     /// from_fd returns the terminal size for the given terminal.
@@ -76,6 +85,10 @@ impl TtySizeExt for TtySize {
         }
 
         Ok(())
+    }
+
+    fn is_usable(&self) -> bool {
+        self.rows > 0 && self.cols > 0
     }
 }
 

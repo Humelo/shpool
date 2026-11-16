@@ -36,4 +36,4 @@ parking_lot = "0.12" # faster more featureful sync primitives
 # rusty wrapper for unix apis
 [dependencies.nix]
 version = "0.31"
-features = ["poll", "ioctl", "process", "signal", "fs"]
+features = ["poll", "ioctl", "process", "signal", "fs", "term"]

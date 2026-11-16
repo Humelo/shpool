@@ -386,6 +386,39 @@ impl Proc {
         Ok(attach::Proc { proc, log_file, events: Some(events) })
     }
 
+    /// Spawns `shpool attach NAME` with `tty` (a pty slave) as its stdin,
+    /// stdout and stderr, so the attach process reads its terminal size from
+    /// that pty the way it does in a real terminal.
+    pub fn attach_on_tty(
+        &mut self,
+        name: &str,
+        tty: std::os::fd::OwnedFd,
+    ) -> anyhow::Result<process::Child> {
+        let log_file = self.tmp_dir.path().join(format!("attach_tty_{}.log", self.subproc_counter));
+        eprintln!("spawning tty attach proc with log {:?}", log_file);
+        self.subproc_counter += 1;
+
+        let mut cmd = Command::new(&self.bin_path);
+        cmd.stdin(Stdio::from(tty.try_clone().context("cloning tty fd")?))
+            .stdout(Stdio::from(tty.try_clone().context("cloning tty fd")?))
+            .stderr(Stdio::from(tty))
+            .arg("--config-file")
+            .arg(&self.config_path)
+            .arg("-v")
+            .arg("--log-file")
+            .arg(&log_file)
+            .arg("--socket")
+            .arg(&self.socket_path)
+            .arg("--no-daemonize")
+            .env_clear();
+        for var in ["XDG_RUNTIME_DIR", "HOME", "PATH"] {
+            if let Ok(value) = env::var(var) {
+                cmd.env(var, value);
+            }
+        }
+        cmd.arg("attach").arg(name).spawn().context(format!("spawning tty attach proc for {name}"))
+    }
+
     pub fn detach(&mut self, sessions: Vec<String>) -> anyhow::Result<process::Output> {
         let log_file = self.tmp_dir.path().join(format!("detach_{}.log", self.subproc_counter));
         eprintln!("spawning detach proc with log {:?}", log_file);

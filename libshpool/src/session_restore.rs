@@ -12,10 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use shpool_protocol::TtySize;
-use tracing::info;
+use std::panic::{self, AssertUnwindSafe};
 
-use crate::config::{self, SessionRestoreEngine, SessionRestoreMode};
+use shpool_protocol::TtySize;
+use tracing::{error, info};
+
+use crate::{
+    config::{self, SessionRestoreEngine, SessionRestoreMode},
+    tty::{TtySizeExt as _, DEFAULT_TTY_SIZE},
+};
 
 // To prevent data getting dropped, we set this to be large, but we don't want
 // to use u16::MAX, since the vt100 crate eagerly fills in its rows, and doing
@@ -173,5 +178,127 @@ pub fn new(
             ),
             mode,
         }),
+    }
+}
+
+/// A spool that survives a panic in the terminal emulator.
+///
+/// shpool_vt100 assumes its cursor row is always valid and unwraps it; a
+/// size or escape sequence that breaks that assumption used to panic the
+/// shell->client thread, which never comes back: every later attach to the
+/// session then fails until the session is killed. On a panic the spool is
+/// rebuilt empty at the last size, so the session keeps working and only the
+/// restore content of that moment is lost. Sizes with a zero dimension are
+/// ignored here as well.
+pub struct Guarded {
+    inner: Box<dyn SessionSpool + 'static>,
+    config: config::Manager,
+    size: TtySize,
+    scrollback_lines: usize,
+}
+
+impl Guarded {
+    pub fn new(config: config::Manager, size: &TtySize, scrollback_lines: usize) -> Self {
+        let size = if size.is_usable() { size.clone() } else { DEFAULT_TTY_SIZE };
+        Guarded {
+            inner: new(config.clone(), &size, scrollback_lines),
+            config,
+            size,
+            scrollback_lines,
+        }
+    }
+
+    fn guard<R>(&mut self, what: &str, f: impl FnOnce(&mut dyn SessionSpool) -> R) -> Option<R> {
+        let inner = &mut self.inner;
+        match panic::catch_unwind(AssertUnwindSafe(|| f(inner.as_mut()))) {
+            Ok(r) => Some(r),
+            Err(_) => {
+                error!(
+                    "session restore spool panicked during {} (rows={}, cols={}), resetting it",
+                    what, self.size.rows, self.size.cols
+                );
+                self.inner = new(self.config.clone(), &self.size, self.scrollback_lines);
+                None
+            }
+        }
+    }
+
+    pub fn resize(&mut self, size: TtySize) {
+        if !size.is_usable() {
+            error!("ignoring unusable spool size (rows={}, cols={})", size.rows, size.cols);
+            return;
+        }
+        self.size = size.clone();
+        self.guard("resize", |s| s.resize(size));
+    }
+
+    pub fn restore_buffer(&mut self) -> Vec<u8> {
+        self.guard("restore", |s| s.restore_buffer()).unwrap_or_default()
+    }
+
+    pub fn process(&mut self, bytes: &[u8]) {
+        self.guard("process", |s| s.process(bytes));
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn size(rows: u16, cols: u16) -> TtySize {
+        TtySize { rows, cols, xpixel: 0, ypixel: 0 }
+    }
+
+    fn screen_config(dir: &tempfile::TempDir) -> anyhow::Result<config::Manager> {
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "session_restore_mode = \"screen\"\n")?;
+        config::Manager::new(path.to_str())
+    }
+
+    /// Stands in for a terminal emulator bug.
+    struct PanickingSpool;
+    impl SessionSpool for PanickingSpool {
+        fn resize(&mut self, _: TtySize) {}
+        fn restore_buffer(&self) -> Vec<u8> {
+            panic!("restore bug")
+        }
+        fn process(&mut self, _: &[u8]) {
+            panic!("process bug")
+        }
+    }
+
+    #[test]
+    fn guarded_spool_survives_a_panic() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = screen_config(&dir)?;
+        let mut spool = Guarded::new(config, &size(24, 80), 100);
+        spool.inner = Box::new(PanickingSpool);
+
+        spool.process(b"lost\r\n");
+        spool.process(b"still-here\r\n");
+        let restored = String::from_utf8_lossy(&spool.restore_buffer()).to_string();
+        assert!(restored.contains("still-here"), "restore after a reset: {restored:?}");
+
+        spool.inner = Box::new(PanickingSpool);
+        assert!(spool.restore_buffer().is_empty(), "a panicking restore yields nothing");
+        spool.process(b"again\r\n");
+        let restored = String::from_utf8_lossy(&spool.restore_buffer()).to_string();
+        assert!(restored.contains("again"), "restore after a second reset: {restored:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn guarded_spool_ignores_zero_sizes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let config = screen_config(&dir)?;
+        let mut spool = Guarded::new(config, &size(0, 0), 100);
+        spool.process(b"first\r\n");
+        spool.resize(size(0, 80));
+        spool.resize(size(24, 0));
+        spool.process(b"second\r\n");
+        let restored = String::from_utf8_lossy(&spool.restore_buffer()).to_string();
+        assert!(restored.contains("first") && restored.contains("second"), "{restored:?}");
+        assert_eq!(spool.size.rows, DEFAULT_TTY_SIZE.rows);
+        Ok(())
     }
 }
