@@ -74,7 +74,7 @@ pub struct Server {
     /// the main thread to become available to accept new connections.
     shells: Arc<Mutex<HashMap<String, Box<shell::Session>>>>,
     runtime_dir: PathBuf,
-    register_new_reapable_session: crossbeam_channel::Sender<(String, Instant)>,
+    register_new_reapable_session: crossbeam_channel::Sender<ttl_reaper::Registration>,
     hooks: Box<dyn hooks::Hooks + Send + Sync>,
     events_bus: Arc<events::EventBus>,
     daily_messenger: Arc<show_motd::DailyMessenger>,
@@ -1183,10 +1183,15 @@ impl Server {
                 child_exit_notifier: shell_to_client_child_exit_notifier,
             })?);
 
+        let inner = Arc::new(Mutex::new(session_inner));
         if let Some(ttl_secs) = header.ttl_secs {
             info!("registering session with ttl with the reaper");
             self.register_new_reapable_session
-                .send((header.name.clone(), Instant::now().add(Duration::from_secs(ttl_secs))))
+                .send(ttl_reaper::Registration {
+                    session_name: header.name.clone(),
+                    inner: Arc::downgrade(&inner),
+                    reap_at: Instant::now().add(Duration::from_secs(ttl_secs)),
+                })
                 .context("sending reapable session registration msg")?;
         }
 
@@ -1197,7 +1202,7 @@ impl Server {
             child_exit_notifier,
             started_at: time::SystemTime::now(),
             lifecycle: shell::SessionLifecycle::default(),
-            inner: Arc::new(Mutex::new(session_inner)),
+            inner,
         })
     }
 
